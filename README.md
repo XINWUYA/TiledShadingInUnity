@@ -12,8 +12,8 @@
 
 + 不使用Tiled Shading
 
-  ![without_tiled_shading](F:\毕业论文\TiledShadingInUnity\Results\without_tiled_shading.png)
+  ![without_tiled_shading](Results\without_tiled_shading.png)
 
 + 使用Tiled Shading
 
-  ![tiled_shading](F:\毕业论文\TiledShadingInUnity\Results\tiled_shading.png)
+  ![tiled_shading](Results\tiled_shading.png)
