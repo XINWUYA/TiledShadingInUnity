@@ -10,10 +10,10 @@
 
 # 结果：
 
-+ 不使用Tiled Shading
++ 不使用Tiled Shading（2.6FPS 383ms）
 
-  ![without_tiled_shading](Results\without_tiled_shading.png)
+  ![without_tiled_shading](Results/without_tiled_shading.png)
 
-+ 使用Tiled Shading
++ 使用Tiled Shading(92.6FPS 10.8ms)
 
-  ![tiled_shading](Results\tiled_shading.png)
+  ![tiled_shading](Results/tiled_shading.png)
