@@ -1,0 +1,183 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CalcuateResultColor
+
+#include "UnityCG.cginc"
+
+#define GROUP_THREAD_NUM_X 16
+#define GROUP_THREAD_NUM_Y 16
+#define MAX_LIGHT_NUM_PRE_TILE 512
+#define TILE_RES 16
+#define UINT_MAX 0x7f7fffff //FLT_MAX as a uint
+
+struct SPointLightInfo
+{
+    float3 Position;
+    float3 Color;
+};
+
+RWTexture2D<float4> _ResultTex;
+RWStructuredBuffer<SPointLightInfo> _PointLightInfoArrayBuffer;
+
+Texture2D<float4> _MainTex;
+Texture2D<float4> _NormalTex;
+Texture2D<float4> _PositionTex;
+Texture2D<float4> _CameraDepthTexture;
+
+float4x4 _InverseProjectionMatrix;
+float4x4 _InverseViewProjectionMatrix;
+
+float _LightRadius;
+float _Near;
+float _Far;
+
+int _TotalPointLightNum;
+int _ScreenWidth;
+int _ScreenHeight;
+
+groupshared uint s_ZMin = UINT_MAX;
+groupshared uint s_ZMax = 0;
+groupshared uint s_CulledLightIndexCnt = 0;
+groupshared uint s_CulledLightIndexArray[MAX_LIGHT_NUM_PRE_TILE];
+
+float ConvertProjDepth2ViewSpace(float vDepth)
+{
+    return 1.0f / (vDepth * _InverseProjectionMatrix._34 + _InverseProjectionMatrix._44);
+}
+
+float4 ConvertProj2ViewSpace(float4 vNDCCoord)
+{
+    vNDCCoord = mul(_InverseProjectionMatrix, vNDCCoord);
+    vNDCCoord /= vNDCCoord.w;
+    return vNDCCoord;
+}
+
+void CalculateFrustumAABB(const float2 vProjFrustumCoords[4], const float vZMinProj, const float vZMaxProj, out float3 voAABBCenter, out float3 voAABBHalfSize)
+{
+    float4 FrustumAABBVertices[8];
+    FrustumAABBVertices[0] = ConvertProj2ViewSpace(float4(vProjFrustumCoords[0], vZMinProj, 1.0f));
+    FrustumAABBVertices[1] = ConvertProj2ViewSpace(float4(vProjFrustumCoords[1], vZMinProj, 1.0f));
+    FrustumAABBVertices[2] = ConvertProj2ViewSpace(float4(vProjFrustumCoords[2], vZMinProj, 1.0f));
+    FrustumAABBVertices[3] = ConvertProj2ViewSpace(float4(vProjFrustumCoords[3], vZMinProj, 1.0f));
+    FrustumAABBVertices[4] = ConvertProj2ViewSpace(float4(vProjFrustumCoords[0], vZMaxProj, 1.0f));
+    FrustumAABBVertices[5] = ConvertProj2ViewSpace(float4(vProjFrustumCoords[1], vZMaxProj, 1.0f));
+    FrustumAABBVertices[6] = ConvertProj2ViewSpace(float4(vProjFrustumCoords[2], vZMaxProj, 1.0f));
+    FrustumAABBVertices[7] = ConvertProj2ViewSpace(float4(vProjFrustumCoords[3], vZMaxProj, 1.0f));
+
+    float3 MinVertex = 10000000.0f;
+    float3 MaxVertex = -10000000.0f;
+    for (int i = 0; i < 8; ++i)
+    {
+        MinVertex = min(MinVertex, FrustumAABBVertices[i].xyz);
+        MaxVertex = max(MaxVertex, FrustumAABBVertices[i].xyz);
+    }
+    voAABBCenter = (MinVertex + MaxVertex) / 2;
+    voAABBHalfSize = (MaxVertex - MinVertex) / 2;
+}
+
+bool IsSphereIntersectFrustumAABB(float3 vSphereCenter, float vSphereRadius, float3 vAABBCenter, float3 vAABBHalfSize)
+{
+    float3 Delta = max(float3(0.0f, 0.0f, 0.0f), abs(vAABBCenter - vSphereCenter) - vAABBHalfSize);
+    float SquareDistance = dot(Delta, Delta);
+    return SquareDistance <= vSphereRadius * vSphereRadius;
+}
+
+[numthreads(GROUP_THREAD_NUM_X, GROUP_THREAD_NUM_Y, 1)]
+void CalcuateResultColor(uint3 globalIdx : SV_DispatchThreadID, uint3 localIdx : SV_GroupThreadID, uint3 groupIdx : SV_GroupID)
+{
+    uint2 SampleIdx = globalIdx.xy;
+    uint LocalIdxFlattened = localIdx.y * GROUP_THREAD_NUM_X + localIdx.x;
+    if (LocalIdxFlattened == 0)
+    {
+        s_ZMin = UINT_MAX;
+        s_ZMax = 0;
+        s_CulledLightIndexCnt = 0;
+    }
+
+    float FragDepth = 1.0f - (_CameraDepthTexture.Load(uint3(SampleIdx, 0)).x);
+    uint FragDepthU = uint(FragDepth * UINT_MAX);
+    InterlockedMax(s_ZMax, FragDepthU);
+    InterlockedMin(s_ZMin, FragDepthU);
+    GroupMemoryBarrierWithGroupSync();
+
+    float ZMinProj = 2.0f * (float(s_ZMin) / float(UINT_MAX)) - 1.0f;
+    float ZMaxProj = 2.0f * (float(s_ZMax) / float(UINT_MAX)) - 1.0f;
+    GroupMemoryBarrierWithGroupSync();
+
+    // Construct frustum
+    uint TileMinX = TILE_RES * groupIdx.x;
+    uint TileMinY = TILE_RES * groupIdx.y;
+    uint TileMaxX = TILE_RES * (groupIdx.x + 1);
+    uint TileMaxY = TILE_RES * (groupIdx.y + 1);
+    float ProjTileMinX = 2.0f * (float(TileMinX) / _ScreenWidth) - 1.0f;
+    float ProjTileMaxX = 2.0f * (float(TileMaxX) / _ScreenWidth) - 1.0f;
+    float ProjTileMinY = 2.0f * (float(TileMinY) / _ScreenHeight) - 1.0f;
+    float ProjTileMaxY = 2.0f * (float(TileMaxY) / _ScreenHeight) - 1.0f;
+    float2 ProjFrustumCoords[4];
+    ProjFrustumCoords[0] = float2(ProjTileMinX, ProjTileMinY);
+    ProjFrustumCoords[1] = float2(ProjTileMaxX, ProjTileMinY);
+    ProjFrustumCoords[2] = float2(ProjTileMaxX, ProjTileMaxY);
+    ProjFrustumCoords[3] = float2(ProjTileMinX, ProjTileMaxY);
+
+    float3 AABBCenter, AABBHalfSize;
+    CalculateFrustumAABB(ProjFrustumCoords, ZMinProj, ZMaxProj, AABBCenter, AABBHalfSize);
+    GroupMemoryBarrierWithGroupSync();
+
+    // loop over the lights and do a sphere vs. frustum intersection test
+    uint ThreadNumInTile = GROUP_THREAD_NUM_X * GROUP_THREAD_NUM_Y * 1;
+    for (uint i = 0; i < asuint(_TotalPointLightNum); i += ThreadNumInTile)
+    {
+        uint k = LocalIdxFlattened + i;
+        if (k < (uint) _TotalPointLightNum)
+        {
+            float3 TempLightPosVS = mul(UNITY_MATRIX_V, float4(_PointLightInfoArrayBuffer[k].Position, 1.0f)).xyz;
+
+            if (IsSphereIntersectFrustumAABB(TempLightPosVS, _LightRadius, AABBCenter, AABBHalfSize))
+            {
+                uint CurrentCulledLightIndexCnt = 0;
+                InterlockedAdd(s_CulledLightIndexCnt, 1, CurrentCulledLightIndexCnt);
+                s_CulledLightIndexArray[CurrentCulledLightIndexCnt] = k;
+            }
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    //Calculate Light Result
+    float3 TotalDiffuseColor = float3(0.0f, 0.0f, 0.0f);
+    float3 FragAlbedo = _MainTex.Load(uint3(SampleIdx, 0)).rgb;
+    float3 FragNormal = normalize(_NormalTex.Load(uint3(SampleIdx, 0)).xyz);
+    float3 FragPosWS = _PositionTex.Load(uint3(SampleIdx, 0)).xyz;
+
+    if (FragDepth != 1.0f)//空处深度为1，忽略
+    {
+        //Calcluate Tiled Light
+        for (uint k = 0; k < s_CulledLightIndexCnt; ++k)
+        {
+            int LightIndex = s_CulledLightIndexArray[k];
+            float3 Frag2PointLightDir = _PointLightInfoArrayBuffer[LightIndex].Position - FragPosWS;
+            float DistanceFrag2PointLight = length(Frag2PointLightDir);
+            float3 DiffuseColor = 0.0f;
+            if (DistanceFrag2PointLight < _LightRadius)
+                DiffuseColor = max(dot(normalize(Frag2PointLightDir), FragNormal), 0.0f) * FragAlbedo * _PointLightInfoArrayBuffer[LightIndex].Color / (DistanceFrag2PointLight * DistanceFrag2PointLight);
+            TotalDiffuseColor += DiffuseColor;
+        }
+        //Calculate All Light Directly
+        /*for (uint k = 0; k < (uint)_TotalPointLightNum; ++k)
+        {
+            float3 Frag2PointLightDir = _PointLightInfoArrayBuffer[k].Position - FragPosWS;
+            float DistanceFrag2PointLight = length(Frag2PointLightDir);
+
+            float3 DiffuseColor = 0.0f;
+            if(DistanceFrag2PointLight < _LightRadius)
+                DiffuseColor = max(dot(normalize(Frag2PointLightDir), FragNormal), 0.0f) * FragAlbedo * _PointLightInfoArrayBuffer[k].Color / (DistanceFrag2PointLight * DistanceFrag2PointLight);
+            TotalDiffuseColor += DiffuseColor;
+        }*/
+    }
+    //float3 ResultColor = FragDepth;// ViewPosZ;
+    //float3 ResultColor = float3(float(groupIdx.x) / 100, float(groupIdx.y) / 100, 0.0f);// TotalDiffuseColor;// float3(1.0, 0.0f, 0.0f);
+    float3 ResultColor = TotalDiffuseColor;// float3(1.0, 0.0f, 0.0f);
+    /*if(s_CulledLightIndexCnt > 100)
+        ResultColor = float3(1.0, 0.0f, 0.0f);*/
+    /*if (FragDepth == 1.0f)
+        ResultColor = float3(1.0, 0.0f, 0.0f);*/
+    _ResultTex[SampleIdx] = float4(ResultColor, 1.0f);
+}
